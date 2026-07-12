@@ -1,0 +1,2077 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use utf8;
+
+use Gtk3 '-init';
+use Glib qw(TRUE FALSE);
+use JSON::PP;
+use MIME::Base64 qw(decode_base64);
+use Cwd qw(abs_path);
+use File::Spec;
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+
+use FindBin qw($RealBin);
+use File::Spec;
+
+use Gtk3::WebKit2;
+
+binmode(STDOUT, ':encoding(UTF-8)');
+binmode(STDERR, ':encoding(UTF-8)');
+
+# Ha nincs hierarchia.txt, ezzel a kezdő sorral hozza létre.
+my $DEFAULT_HIERARCHY_LINE = './lower';
+
+# A kezdő lower mappa neve. Ez a projektmappán belül jön létre.
+my $DEFAULT_LOWER_DIR = './lower';
+
+# Ha nem üres, ezt a terminált próbálja először.
+my $PREFERRED_TERMINAL = '';
+
+# Rendszer alapértelmezett terminál lekérdezéséhez.
+my $SYSTEM_TERMINAL_CANDIDATE = 'x-terminal-emulator';
+
+# Itt állítható be, hogy melyik dsOverlay bináris fusson.
+#my $DSOVERLAY_BIN = '/opt/bin/dsOverlay';
+
+my $DSOVERLAY_BIN = File::Spec->catfile($RealBin, 'dsOverlay');
+
+if (!-f $DSOVERLAY_BIN)
+{
+	die "A dsOverlay nem található: $DSOVERLAY_BIN\n";
+}
+
+if (!-x $DSOVERLAY_BIN)
+{
+	die "A dsOverlay nem futtatható: $DSOVERLAY_BIN\n";
+}
+
+my $APP_TITLE = 'dsOverlay hierarchia szerkesztő';
+
+# Saját ablak/tálca ikon base64-ben.
+my $APP_ICON_BASE64 = <<'APP_ICON_BASE64_END';
+iVBORw0KGgoAAAANSUhEUgAAADIAAAAyCAYAAAAeP4ixAAAB30lEQVR4nO2Yr5aCUBDGP/ZsMlNIFqsEC4Vs8gn2IaRYfAKK5fIGBn0Ck9lCIdytdgp5Kxs8KMvy585lQM/u/TU9IzMf38yVATAYDAaDwWAwDIWlErTcOfnCt5Uvmlwy7YLOm1SppiqtP1runBwAKCL6UtwEqqC3roAxRfTJ16i63E6hJwPVC25jV2hVUiG5ZCRX3lWCKMWFngy4xFDobC0q29gVFAe5YBfyLJRmpMo+CmF7nnKSLI7plVVIj6vWeVGakYJ9FAIASYROfD2nHGgWRG4tnqLodOVVdqTcTnJtKw+zG2VsJ9gt/ymvc4XUWgWU4uTaDjjFNDH4qeVGmaA4qMufOX5HETKGK1ozUscBU8x9pzkggZD+4+PnJdVL5AHu8ffXvYUcMAWAdhE1UOPLSJHmAOAGX/fTi6W1+hTFla+XIz/aaXFVn4Fk1vs4nvsOpEjzwhW2GSEVt7gGHGLKNLbWeZNafXbvVpKZIDmoQOeMDCaGmdbWuq+aO+TsmQtXmFpMaUbOm9RyPgYUQ4lvgG/YdWFyxDxrvRrKQtLjyuLYvYeC7MiriiEN+2PFvL0IwHPW91q03nyXkWKSj/3QCNzWAPanX+3dgjFfb0cKpJjw/2E2UHbCYDD8M74BTEqgmC0H6YAAAAAASUVORK5CYII=
+APP_ICON_BASE64_END
+
+my $CURRENT_GID_LIST = $(;
+my ($CURRENT_GID) = split(/\s+/, $CURRENT_GID_LIST);
+
+my $ORIGINAL_UID = $ENV{'DSOVERLAYGUI_ORIGINAL_UID'} // $ENV{'SUDO_UID'} // $<;
+my $ORIGINAL_GID = $ENV{'DSOVERLAYGUI_ORIGINAL_GID'} // $ENV{'SUDO_GID'} // $CURRENT_GID;
+my $ORIGINAL_USER = $ENV{'DSOVERLAYGUI_ORIGINAL_USER'} // $ENV{'SUDO_USER'} // $ENV{'USER'} // '';
+my $ORIGINAL_HOME = $ENV{'DSOVERLAYGUI_ORIGINAL_HOME'} // $ENV{'HOME'} // '';
+
+$ORIGINAL_UID = int($ORIGINAL_UID);
+$ORIGINAL_GID = int($ORIGINAL_GID);
+
+my $project_dir = '';
+my $hierarchy_file = '';
+my $hierarchy_dir = '';
+
+my @items = ();
+
+my $dirty = 0;
+my $dirty_since_remount = 0;
+
+my $window;
+my $webview;
+my $json = JSON::PP->new->utf8->canonical;
+
+my $APP_ICON_PIXBUF = undef;
+my $last_title_message = '';
+
+sub is_root
+{
+	return ($> == 0) ? 1 : 0;
+}
+
+sub flush_gtk_events
+{
+	while (Gtk3::events_pending())
+	{
+		Gtk3::main_iteration();
+	}
+}
+
+sub create_pixbuf_from_base64
+{
+	my ($base64_data) = @_;
+
+	return undef if !defined $base64_data;
+
+	$base64_data =~ s/\s+//g;
+
+	return undef if $base64_data eq '';
+
+	my $image_data = decode_base64($base64_data);
+	my $loader = Gtk3::Gdk::PixbufLoader->new();
+
+	eval
+	{
+		$loader->write($image_data);
+		$loader->close();
+	};
+
+	if ($@)
+	{
+		warn "Nem sikerült betölteni a base64 ikont: $@\n";
+		return undef;
+	}
+
+	return $loader->get_pixbuf();
+}
+
+sub get_app_icon_pixbuf
+{
+	if (defined $APP_ICON_PIXBUF)
+	{
+		return $APP_ICON_PIXBUF;
+	}
+
+	$APP_ICON_PIXBUF = create_pixbuf_from_base64($APP_ICON_BASE64);
+
+	return $APP_ICON_PIXBUF;
+}
+
+sub set_app_icon
+{
+	my ($target_window) = @_;
+
+	my $pixbuf = get_app_icon_pixbuf();
+
+	if (!defined $pixbuf)
+	{
+		return;
+	}
+
+	eval
+	{
+		Gtk3::Window::set_default_icon($pixbuf);
+	};
+
+	if (defined $target_window)
+	{
+		eval
+		{
+			$target_window->set_icon($pixbuf);
+		};
+
+		if ($@)
+		{
+			warn "Nem sikerült beállítani az ablak ikonját: $@\n";
+		}
+	}
+}
+
+sub close_dialog_cleanly
+{
+	my ($dialog) = @_;
+
+	return if !defined $dialog;
+
+	$dialog->hide();
+	$dialog->destroy();
+
+	flush_gtk_events();
+	select(undef, undef, undef, 0.05);
+	flush_gtk_events();
+}
+
+sub trim_line
+{
+	my ($line) = @_;
+
+	$line =~ s/\r?\n$//;
+	$line =~ s/^\s+//;
+	$line =~ s/\s+$//;
+
+	return $line;
+}
+
+sub uri_unescape
+{
+	my ($s) = @_;
+
+	$s =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+
+	return $s;
+}
+
+sub canonical_dir
+{
+	my ($path) = @_;
+
+	my $abs = abs_path($path);
+
+	if (!defined $abs || $abs eq '')
+	{
+		return '';
+	}
+
+	if (!-d $abs)
+	{
+		return '';
+	}
+
+	return $abs;
+}
+
+sub js_string
+{
+	my ($s) = @_;
+
+	return $json->encode($s);
+}
+
+sub js_call
+{
+	my ($code) = @_;
+
+	$webview->run_javascript($code, undef, undef, undef);
+}
+
+sub shell_quote
+{
+	my ($s) = @_;
+
+	$s =~ s/'/'"'"'/g;
+
+	return "'" . $s . "'";
+}
+
+sub show_error
+{
+	my ($msg) = @_;
+
+	if (defined $window)
+	{
+		my $dialog = Gtk3::MessageDialog->new(
+			$window,
+			'destroy-with-parent',
+			'error',
+			'ok',
+			$msg
+		);
+
+		set_app_icon($dialog);
+
+		$dialog->set_title('Hiba');
+		$dialog->run();
+
+		close_dialog_cleanly($dialog);
+	}
+	else
+	{
+		print STDERR "HIBA: $msg\n";
+	}
+}
+
+sub die_gui
+{
+	my ($msg) = @_;
+
+	show_error($msg);
+
+	die "$msg\n";
+}
+
+sub info_gui
+{
+	my ($msg) = @_;
+
+	my $dialog = Gtk3::MessageDialog->new(
+		$window,
+		'destroy-with-parent',
+		'info',
+		'ok',
+		$msg
+	);
+
+	set_app_icon($dialog);
+
+	$dialog->set_title('Információ');
+	$dialog->run();
+
+	close_dialog_cleanly($dialog);
+}
+
+sub ask_yes_no
+{
+	my ($msg) = @_;
+
+	my $dialog = Gtk3::MessageDialog->new(
+		$window,
+		'destroy-with-parent',
+		'question',
+		'yes-no',
+		$msg
+	);
+
+	set_app_icon($dialog);
+
+	$dialog->set_title('Megerősítés');
+
+	my $response = $dialog->run();
+
+	close_dialog_cleanly($dialog);
+
+	return ($response eq 'yes') ? 1 : 0;
+}
+
+sub ask_yes_no_no_parent
+{
+	my ($msg) = @_;
+
+	my $dialog = Gtk3::MessageDialog->new(
+		undef,
+		'destroy-with-parent',
+		'question',
+		'yes-no',
+		$msg
+	);
+
+	set_app_icon($dialog);
+
+	$dialog->set_title('Megerősítés');
+
+	my $response = $dialog->run();
+
+	close_dialog_cleanly($dialog);
+
+	return ($response eq 'yes') ? 1 : 0;
+}
+
+sub show_error_no_parent
+{
+	my ($msg) = @_;
+
+	my $dialog = Gtk3::MessageDialog->new(
+		undef,
+		'destroy-with-parent',
+		'error',
+		'ok',
+		$msg
+	);
+
+	set_app_icon($dialog);
+
+	$dialog->set_title('Hiba');
+	$dialog->run();
+
+	close_dialog_cleanly($dialog);
+}
+
+sub show_warning_no_parent
+{
+	my ($msg) = @_;
+
+	my $dialog = Gtk3::MessageDialog->new(
+		undef,
+		'destroy-with-parent',
+		'warning',
+		'ok',
+		$msg
+	);
+
+	set_app_icon($dialog);
+
+	$dialog->set_title('Figyelmeztetés');
+	$dialog->run();
+
+	close_dialog_cleanly($dialog);
+}
+
+sub can_drop_to_original_user
+{
+	return 0 if !is_root();
+	return 0 if !defined $ORIGINAL_UID;
+	return 0 if !defined $ORIGINAL_GID;
+	return 0 if $ORIGINAL_UID <= 0;
+
+	return 1;
+}
+
+sub run_as_original_user
+{
+	my ($callback) = @_;
+
+	if (!can_drop_to_original_user())
+	{
+		return $callback->();
+	}
+
+	my $old_euid = $>;
+	my $old_egid = $);
+	my $old_home = $ENV{'HOME'};
+	my $old_user = $ENV{'USER'};
+	my $old_logname = $ENV{'LOGNAME'};
+
+	my @result;
+
+	eval
+	{
+		$) = "$ORIGINAL_GID $ORIGINAL_GID";
+		$> = $ORIGINAL_UID;
+
+		if ($ORIGINAL_HOME ne '')
+		{
+			$ENV{'HOME'} = $ORIGINAL_HOME;
+		}
+
+		if ($ORIGINAL_USER ne '')
+		{
+			$ENV{'USER'} = $ORIGINAL_USER;
+			$ENV{'LOGNAME'} = $ORIGINAL_USER;
+		}
+
+		@result = $callback->();
+
+		$> = $old_euid;
+		$) = $old_egid;
+
+		if (defined $old_home)
+		{
+			$ENV{'HOME'} = $old_home;
+		}
+		else
+		{
+			delete $ENV{'HOME'};
+		}
+
+		if (defined $old_user)
+		{
+			$ENV{'USER'} = $old_user;
+		}
+		else
+		{
+			delete $ENV{'USER'};
+		}
+
+		if (defined $old_logname)
+		{
+			$ENV{'LOGNAME'} = $old_logname;
+		}
+		else
+		{
+			delete $ENV{'LOGNAME'};
+		}
+	};
+
+	if ($@)
+	{
+		my $err = $@;
+
+		eval
+		{
+			$> = $old_euid;
+			$) = $old_egid;
+		};
+
+		die_gui("Nem sikerült ideiglenesen az eredeti user nevében futtatni a műveletet:\n\n$err");
+	}
+
+	return wantarray ? @result : $result[0];
+}
+
+sub select_project_dir
+{
+	my $dirname = run_as_original_user(sub
+	{
+		my $dialog = Gtk3::FileChooserDialog->new(
+			'Válaszd ki a dsOverlay projektmappát',
+			undef,
+			'select-folder',
+			'gtk-cancel' => 'cancel',
+			'gtk-open' => 'accept'
+		);
+
+		set_app_icon($dialog);
+
+		my $response = $dialog->run();
+		my $dirname_inner = '';
+
+		if ($response eq 'accept')
+		{
+			$dirname_inner = $dialog->get_filename();
+		}
+
+		close_dialog_cleanly($dialog);
+
+		return $dirname_inner;
+	});
+
+	return $dirname // '';
+}
+
+sub default_lower_abs_path
+{
+	my ($proj_dir) = @_;
+
+	my $lower_path = $DEFAULT_LOWER_DIR;
+
+	if ($lower_path !~ m{^/})
+	{
+		$lower_path = File::Spec->catdir($proj_dir, $lower_path);
+	}
+
+	return $lower_path;
+}
+
+sub chmod_777_if_exists
+{
+	my ($path) = @_;
+
+	return if !defined $path;
+	return if $path eq '';
+	return if !-e $path;
+
+	chmod 0777, $path;
+}
+
+sub try_create_default_hierarchy
+{
+	my ($proj_dir, $show_error) = @_;
+
+	my $hierarchy_path = File::Spec->catfile($proj_dir, 'hierarchia.txt');
+	my $lower_path = default_lower_abs_path($proj_dir);
+
+	if (-f $hierarchy_path)
+	{
+		return 1;
+	}
+
+	if (!-d $lower_path)
+	{
+		eval
+		{
+			make_path($lower_path);
+		};
+
+		if ($@ || !-d $lower_path)
+		{
+			my $msg =
+				"Nem sikerült létrehozni az alapértelmezett lower mappát:\n\n" .
+				"$lower_path\n\n" .
+				"A hierarchia.txt fájlt ezért nem hozom létre.";
+
+			if ($show_error)
+			{
+				show_error_no_parent($msg);
+			}
+			else
+			{
+				show_warning_no_parent($msg);
+			}
+
+			return 0;
+		}
+
+		chmod_777_if_exists($lower_path);
+	}
+
+	open(my $fh, '>:encoding(UTF-8)', $hierarchy_path);
+
+	if (!$fh)
+	{
+		my $msg =
+			"Az alapértelmezett lower mappa létrejött, de a hierarchia.txt létrehozása nem sikerült:\n\n" .
+			"$hierarchy_path\n\n" .
+			"$!";
+
+		if ($show_error)
+		{
+			show_error_no_parent($msg);
+		}
+		else
+		{
+			show_warning_no_parent($msg);
+		}
+
+		return 0;
+	}
+
+	print $fh "$DEFAULT_HIERARCHY_LINE\n";
+	close($fh);
+
+	chmod_777_if_exists($hierarchy_path);
+
+	return 1;
+}
+
+sub select_project_dir_with_optional_create
+{
+	while (1)
+	{
+		my $selected_dir = select_project_dir();
+
+		if ($selected_dir eq '')
+		{
+			exit 0;
+		}
+
+		my $proj_dir = canonical_dir($selected_dir);
+
+		if ($proj_dir eq '')
+		{
+			show_warning_no_parent(
+				"A kiválasztott projektmappa nem létezik vagy nem könyvtár:\n\n" .
+				"$selected_dir"
+			);
+
+			next;
+		}
+
+		my $hierarchy_path = File::Spec->catfile($proj_dir, 'hierarchia.txt');
+
+		if (-f $hierarchy_path)
+		{
+			return $proj_dir;
+		}
+
+		my $yes = ask_yes_no_no_parent(
+			"Ebben a projektmappában nincs hierarchia.txt:\n\n" .
+			"$proj_dir\n\n" .
+			"Létrehozzam?\n\n" .
+			"Először ez a mappa jön létre:\n" .
+			default_lower_abs_path($proj_dir) . "\n\n" .
+			"Csak ezután jön létre a hierarchia.txt ezzel a kezdő sorral:\n" .
+			"$DEFAULT_HIERARCHY_LINE\n\n" .
+			"Ha a lower mappa létrehozása nem sikerül, a TXT-t meg sem próbálom létrehozni."
+		);
+
+		if (!$yes)
+		{
+			next;
+		}
+
+		try_create_default_hierarchy($proj_dir, 0);
+
+		return $proj_dir;
+	}
+}
+
+sub restart_self_with_pkexec_if_needed
+{
+	my ($proj_dir) = @_;
+
+	if (is_root())
+	{
+		return;
+	}
+
+	if (exists $ENV{'DSOVERLAYGUI_PKEXEC_TRIED'})
+	{
+		warn "Nem root joggal futok, de a pkexec próbálkozás már megtörtént. Folytatás normál joggal.\n";
+		return;
+	}
+
+	my $script = abs_path($0);
+
+	if (!defined $script || $script eq '')
+	{
+		warn "Nem tudom feloldani a saját script útvonalát. Folytatás normál joggal.\n";
+		return;
+	}
+
+	my $pkexec = `command -v pkexec 2>/dev/null`;
+	chomp($pkexec);
+
+	if ($pkexec eq '')
+	{
+		warn "Nincs pkexec a rendszeren. Folytatás normál joggal.\n";
+		return;
+	}
+
+	system('sh', '-c', 'command -v xhost >/dev/null 2>&1 && xhost +SI:localuser:root >/dev/null 2>&1');
+
+	my @env_args = (
+		'DSOVERLAYGUI_PKEXEC_TRIED=1',
+		'DSOVERLAYGUI_ORIGINAL_UID=' . $ORIGINAL_UID,
+		'DSOVERLAYGUI_ORIGINAL_GID=' . $ORIGINAL_GID,
+		'DSOVERLAYGUI_ORIGINAL_USER=' . $ORIGINAL_USER,
+		'DSOVERLAYGUI_ORIGINAL_HOME=' . $ORIGINAL_HOME,
+	);
+
+	foreach my $key (
+		'DISPLAY',
+		'XAUTHORITY',
+		'WAYLAND_DISPLAY',
+		'XDG_RUNTIME_DIR',
+		'DBUS_SESSION_BUS_ADDRESS',
+		'LANG',
+		'LC_ALL',
+		'LC_CTYPE'
+	)
+	{
+		if (exists $ENV{$key} && defined $ENV{$key} && $ENV{$key} ne '')
+		{
+			push @env_args, $key . '=' . $ENV{$key};
+		}
+	}
+
+	my @cmd = (
+		$pkexec,
+		'env',
+		@env_args,
+		$^X,
+		$script,
+		$proj_dir
+	);
+
+	my $ret = system(@cmd);
+
+	if ($ret == 0)
+	{
+		exit 0;
+	}
+
+	my $exit_code = $ret >> 8;
+
+	warn "A pkexec újraindítás nem sikerült vagy megszakadt. Exit code: $exit_code. Folytatás normál joggal.\n";
+
+	return;
+}
+
+sub init_paths
+{
+	my @args = @ARGV;
+
+	if (@args >= 1)
+	{
+		$project_dir = canonical_dir($args[0]);
+
+		if ($project_dir eq '')
+		{
+			die "Nem létező projekt mappa: $args[0]\n";
+		}
+	}
+	else
+	{
+		$project_dir = select_project_dir_with_optional_create();
+	}
+
+	restart_self_with_pkexec_if_needed($project_dir);
+
+	my $hierarchy_path = File::Spec->catfile($project_dir, 'hierarchia.txt');
+
+	if (!-f $hierarchy_path)
+	{
+		my $ok = try_create_default_hierarchy($project_dir, 1);
+
+		if (!$ok || !-f $hierarchy_path)
+		{
+			show_error_no_parent(
+				"Nem sikerült létrehozni a hierarchia.txt fájlt:\n\n" .
+				"$hierarchy_path\n\n" .
+				"A program kilép."
+			);
+
+			exit 1;
+		}
+	}
+
+	$hierarchy_file = File::Spec->catfile($project_dir, 'hierarchia.txt');
+
+	my $abs_file = abs_path($hierarchy_file);
+
+	if (!defined $abs_file || !-f $abs_file)
+	{
+		die "Nem létező vagy nem feloldható hierarchia fájl: $hierarchy_file\n";
+	}
+
+	$hierarchy_file = $abs_file;
+	$hierarchy_dir = dirname($hierarchy_file);
+}
+
+sub load_hierarchy
+{
+	@items = ();
+
+	open(my $fh, '<:encoding(UTF-8)', $hierarchy_file) or die_gui("Nem tudom olvasni:\n$hierarchy_file\n\n$!");
+
+	while (my $line = <$fh>)
+	{
+		chomp($line);
+		$line =~ s/\r$//;
+
+		my $clean = trim_line($line);
+
+		next if $clean eq '';
+
+		my $enabled = 1;
+		my $path = $clean;
+
+		if ($path =~ /^#/)
+		{
+			$enabled = 0;
+			$path =~ s/^#//;
+			$path = trim_line($path);
+		}
+
+		push @items, {
+			enabled => $enabled ? 1 : 0,
+			path => $path,
+		};
+	}
+
+	close($fh);
+
+	$dirty = 0;
+	$dirty_since_remount = 0;
+}
+
+sub save_hierarchy
+{
+	open(my $fh, '>:encoding(UTF-8)', $hierarchy_file) or die_gui("Nem tudom írni:\n$hierarchy_file\n\n$!");
+
+	foreach my $item (@items)
+	{
+		my $path = trim_line($item->{path} // '');
+
+		next if $path eq '';
+
+		if ($item->{enabled})
+		{
+			print $fh "$path\n";
+		}
+		else
+		{
+			print $fh "#$path\n";
+		}
+	}
+
+	close($fh);
+
+	$dirty = 0;
+	$dirty_since_remount = 1;
+}
+
+sub make_relative_if_inside
+{
+	my ($selected) = @_;
+
+	my $abs_selected = abs_path($selected);
+
+	if (!defined $abs_selected || $abs_selected eq '')
+	{
+		$abs_selected = File::Spec->rel2abs($selected);
+	}
+
+	my $base = abs_path($hierarchy_dir);
+
+	if (!defined $base || $base eq '')
+	{
+		return $selected;
+	}
+
+	if ($abs_selected eq $base)
+	{
+		return './';
+	}
+
+	my $prefix = $base . '/';
+
+	if (index($abs_selected, $prefix) == 0)
+	{
+		my $rest = substr($abs_selected, length($prefix));
+		return './' . $rest;
+	}
+
+	return $abs_selected;
+}
+
+sub resolve_item_start_dir
+{
+	my ($item) = @_;
+
+	if (!defined $item)
+	{
+		return $hierarchy_dir;
+	}
+
+	my $path = $item->{path} // '';
+
+	if ($path eq '')
+	{
+		return $hierarchy_dir;
+	}
+
+	if ($path !~ m{^/})
+	{
+		$path = File::Spec->catdir($hierarchy_dir, $path);
+	}
+
+	my $abs = abs_path($path);
+
+	if (defined $abs && -d $abs)
+	{
+		return $abs;
+	}
+
+	return $hierarchy_dir;
+}
+
+sub choose_directory
+{
+	my ($start_dir) = @_;
+
+	my $selected = run_as_original_user(sub
+	{
+		my $dialog = Gtk3::FileChooserDialog->new(
+			'Válassz mappát',
+			$window,
+			'select-folder',
+			'gtk-cancel' => 'cancel',
+			'gtk-open' => 'accept'
+		);
+
+		set_app_icon($dialog);
+
+		if (defined $start_dir && $start_dir ne '' && -d $start_dir)
+		{
+			$dialog->set_current_folder($start_dir);
+		}
+		else
+		{
+			$dialog->set_current_folder($hierarchy_dir);
+		}
+
+		my $response = $dialog->run();
+		my $selected_inner = '';
+
+		if ($response eq 'accept')
+		{
+			$selected_inner = $dialog->get_filename();
+		}
+
+		close_dialog_cleanly($dialog);
+
+		return $selected_inner;
+	});
+
+	if (!defined $selected || $selected eq '')
+	{
+		return '';
+	}
+
+	return make_relative_if_inside($selected);
+}
+
+sub get_overlay_mount_status
+{
+	my $out_dir = File::Spec->catdir($project_dir, 'out');
+
+	if (!-d $out_dir)
+	{
+		return (0, $out_dir);
+	}
+
+	my $ret = system('mountpoint', '-q', $out_dir);
+
+	if ($ret == 0)
+	{
+		return (1, $out_dir);
+	}
+
+	return (0, $out_dir);
+}
+
+sub refresh_web
+{
+	my ($overlay_mounted, $overlay_out_dir) = get_overlay_mount_status();
+
+	my $payload = {
+		project_dir => $project_dir,
+		hierarchy_file => $hierarchy_file,
+		hierarchy_dir => $hierarchy_dir,
+		dsoverlay_bin => $DSOVERLAY_BIN,
+		items => \@items,
+		dirty => $dirty ? 1 : 0,
+		dirty_since_remount => $dirty_since_remount ? 1 : 0,
+		is_root => is_root() ? 1 : 0,
+		overlay_mounted => $overlay_mounted ? 1 : 0,
+		overlay_out_dir => $overlay_out_dir,
+	};
+
+	my $encoded = $json->encode($payload);
+
+	js_call('window.dsSetState(' . $encoded . ');');
+}
+
+sub set_items_from_payload
+{
+	my ($data) = @_;
+
+	if (ref($data->{items}) ne 'ARRAY')
+	{
+		die_gui('Hibás items mező');
+	}
+
+	@items = ();
+
+	foreach my $in_item (@{$data->{items}})
+	{
+		next if ref($in_item) ne 'HASH';
+
+		my $path = trim_line($in_item->{path} // '');
+
+		next if $path eq '';
+
+		my $enabled = $in_item->{enabled} ? 1 : 0;
+
+		push @items, {
+			enabled => $enabled,
+			path => $path,
+		};
+	}
+
+	save_hierarchy();
+	refresh_web();
+}
+
+sub has_parent_terminal
+{
+	if (-t STDIN || -t STDERR)
+	{
+		return 1;
+	}
+
+	return 0;
+}
+
+sub command_exists
+{
+	my ($cmd) = @_;
+
+	return 0 if !defined $cmd;
+	return 0 if $cmd eq '';
+
+	my $ret = system('sh', '-c', 'command -v "$1" >/dev/null 2>&1', 'sh', $cmd);
+
+	return ($ret == 0) ? 1 : 0;
+}
+
+sub make_terminal_command
+{
+	my ($terminal, $terminal_cmd) = @_;
+
+	if ($terminal eq 'gnome-terminal')
+	{
+		return ($terminal, '--', 'bash', '-lc', $terminal_cmd);
+	}
+
+	if ($terminal eq 'xfce4-terminal')
+	{
+		return ($terminal, '-e', 'bash -lc ' . shell_quote($terminal_cmd));
+	}
+
+	if ($terminal eq 'mate-terminal')
+	{
+		return ($terminal, '-e', 'bash -lc ' . shell_quote($terminal_cmd));
+	}
+
+	if ($terminal eq 'konsole')
+	{
+		return ($terminal, '-e', 'bash', '-lc', $terminal_cmd);
+	}
+
+	if ($terminal eq 'xterm')
+	{
+		return ($terminal, '-e', 'bash', '-lc', $terminal_cmd);
+	}
+
+	if ($terminal eq 'x-terminal-emulator')
+	{
+		return ($terminal, '-e', 'bash', '-lc', $terminal_cmd);
+	}
+
+	return ($terminal, '-e', 'bash', '-lc', $terminal_cmd);
+}
+
+sub unique_terminal_list
+{
+	my @in = @_;
+	my %seen = ();
+	my @out = ();
+
+	foreach my $t (@in)
+	{
+		next if !defined $t;
+		next if $t eq '';
+
+		if (!$seen{$t})
+		{
+			push @out, $t;
+			$seen{$t} = 1;
+		}
+	}
+
+	return @out;
+}
+
+sub start_terminal_command_and_wait
+{
+	my ($terminal_cmd) = @_;
+
+	my @tried = ();
+	my @not_found = ();
+	my @failed_start = ();
+
+	my @terminals = unique_terminal_list(
+		$PREFERRED_TERMINAL,
+		$SYSTEM_TERMINAL_CANDIDATE,
+		'x-terminal-emulator',
+		'gnome-terminal',
+		'xfce4-terminal',
+		'mate-terminal',
+		'konsole',
+		'xterm'
+	);
+
+	foreach my $terminal (@terminals)
+	{
+		push @tried, $terminal;
+
+		if (!command_exists($terminal))
+		{
+			push @not_found, $terminal;
+			next;
+		}
+
+		my @exec_cmd = make_terminal_command($terminal, $terminal_cmd);
+
+		my $pid = fork();
+
+		if (!defined $pid)
+		{
+			push @failed_start, "$terminal - fork hiba";
+			next;
+		}
+
+		if ($pid == 0)
+		{
+			exec @exec_cmd;
+			exit 127;
+		}
+
+		waitpid($pid, 0);
+
+		my $ret = $?;
+
+		if ($ret == -1)
+		{
+			push @failed_start, "$terminal - waitpid hiba";
+			return (0, 255, $terminal);
+		}
+
+		if ($ret & 127)
+		{
+			my $signal = $ret & 127;
+			return (0, 128 + $signal, $terminal);
+		}
+
+		my $exit_code = $ret >> 8;
+
+		return (($exit_code == 0) ? 1 : 0, $exit_code, $terminal);
+	}
+
+	my $msg = "Nem találok használható terminál emulátort.\n\n";
+
+	$msg .= "Beállított terminál:\n";
+	$msg .= "  " . ($PREFERRED_TERMINAL ne '' ? $PREFERRED_TERMINAL : '(nincs megadva)') . "\n\n";
+
+	$msg .= "Rendszer alapértelmezett terminál jelölt:\n";
+	$msg .= "  $SYSTEM_TERMINAL_CANDIDATE\n\n";
+
+	$msg .= "Próbált terminálok:\n";
+	foreach my $t (@tried)
+	{
+		$msg .= "  $t\n";
+	}
+
+	if (@not_found)
+	{
+		$msg .= "\nNem található parancsok:\n";
+
+		foreach my $t (@not_found)
+		{
+			$msg .= "  $t\n";
+		}
+	}
+
+	if (@failed_start)
+	{
+		$msg .= "\nIndítási hibák:\n";
+
+		foreach my $t (@failed_start)
+		{
+			$msg .= "  $t\n";
+		}
+	}
+
+	$msg .= "\nMegoldás:\n";
+	$msg .= "  - állítsd be a script elején a \$PREFERRED_TERMINAL változót,\n";
+	$msg .= "  - vagy telepíts egy terminált,\n";
+	$msg .= "  - vagy indítsd a dsOverlayGUI-t terminálból.\n\n";
+
+	die_gui($msg);
+
+	return (0, 255, '');
+}
+
+sub run_dsoverlay
+{
+	my ($cmd) = @_;
+
+	save_hierarchy() if $dirty;
+
+	my @cmd = ($DSOVERLAY_BIN, $cmd, $project_dir);
+	my $cmd_text = join(' ', map { shell_quote($_) } @cmd);
+
+	if (is_root())
+	{
+		my $dialog = Gtk3::MessageDialog->new(
+			$window,
+			'destroy-with-parent',
+			'info',
+			'ok',
+			"Root joggal futó GUI.\n\nParancs közvetlen indítása:\n$cmd_text\n\nAz OK után lefut a dsOverlay."
+		);
+
+		set_app_icon($dialog);
+
+		$dialog->set_title('dsOverlay indítása');
+		$dialog->run();
+
+		close_dialog_cleanly($dialog);
+
+		my $ret = system(@cmd);
+
+		if ($ret == 0)
+		{
+			return 1;
+		}
+
+		my $exit_code = $ret >> 8;
+
+		die_gui(
+			"A dsOverlay hibával tért vissza.\n\n" .
+			"Rootként futó GUI-ból indítva.\n\n" .
+			"Parancs:\n$cmd_text\n\n" .
+			"Exit code: $exit_code"
+		);
+
+		return 0;
+	}
+
+	if (has_parent_terminal())
+	{
+		my $dialog = Gtk3::MessageDialog->new(
+			$window,
+			'destroy-with-parent',
+			'info',
+			'ok',
+			"Parancs indítása a meglévő terminálban:\n$cmd_text\n\nAz OK után indul a dsOverlay.\nHa sudo jelszót kér, azt ebben a terminálban add meg."
+		);
+
+		set_app_icon($dialog);
+
+		$dialog->set_title('dsOverlay indítása');
+		$dialog->run();
+
+		close_dialog_cleanly($dialog);
+
+		my $ret = system(@cmd);
+
+		if ($ret == 0)
+		{
+			return 1;
+		}
+
+		my $exit_code = $ret >> 8;
+
+		die_gui("A dsOverlay hibával tért vissza.\n\nParancs:\n$cmd_text\n\nExit code: $exit_code");
+
+		return 0;
+	}
+
+	my $start_dialog = Gtk3::MessageDialog->new(
+		$window,
+		'destroy-with-parent',
+		'info',
+		'ok',
+		"Parancs indítása külön terminálban:\n$cmd_text\n\nAz OK után megnyílik egy terminál.\nHa sudo jelszót kér, azt ott add meg.\n\nA sikeres futás üzenete csak a terminál bezárása után jelenik meg."
+	);
+
+	set_app_icon($start_dialog);
+
+	$start_dialog->set_title('dsOverlay indítása');
+	$start_dialog->run();
+
+	close_dialog_cleanly($start_dialog);
+
+	my $terminal_cmd =
+		$cmd_text .
+		'; ds_overlay_ret=$?' .
+		'; echo' .
+		'; echo "dsOverlay exit code: $ds_overlay_ret"' .
+		'; echo' .
+		'; echo "Nyomj ENTER-t az ablak bezárásához..."' .
+		'; read dummy' .
+		'; exit $ds_overlay_ret';
+
+	my ($ok, $exit_code, $used_terminal) = start_terminal_command_and_wait($terminal_cmd);
+
+	if (!$ok)
+	{
+		die_gui(
+			"A dsOverlay hibával tért vissza vagy a terminál hibával zárult.\n\n" .
+			"Terminál:\n$used_terminal\n\n" .
+			"Parancs:\n$cmd_text\n\n" .
+			"Exit code: $exit_code"
+		);
+
+		return 0;
+	}
+
+	return 1;
+}
+
+sub do_remount
+{
+	my $ok = run_dsoverlay('remount');
+
+	if ($ok)
+	{
+		$dirty_since_remount = 0;
+		refresh_web();
+		info_gui('Remount kész.');
+	}
+}
+
+sub do_umount
+{
+	my $ok = run_dsoverlay('umount');
+
+	if ($ok)
+	{
+		refresh_web();
+		info_gui('Umount kész.');
+	}
+}
+
+sub handle_message
+{
+	my ($msg_text) = @_;
+
+	my $data;
+
+	eval
+	{
+		$data = $json->decode($msg_text);
+	};
+
+	if ($@)
+	{
+		die_gui("Hibás JSON üzenet:\n$@");
+		return;
+	}
+
+	my $cmd = $data->{cmd} // '';
+
+	if ($cmd eq 'ready')
+	{
+		refresh_web();
+		return;
+	}
+
+	if ($cmd eq 'save_items')
+	{
+		set_items_from_payload($data);
+		return;
+	}
+
+	if ($cmd eq 'browse_new')
+	{
+		my $selected = choose_directory($hierarchy_dir);
+
+		if ($selected ne '')
+		{
+			js_call('window.dsBrowseResult(' . js_string($selected) . ');');
+		}
+
+		return;
+	}
+
+	if ($cmd eq 'browse_edit')
+	{
+		my $index = $data->{index};
+		my $item = undef;
+
+		if (defined $index && $index =~ /^\d+$/ && $index >= 0 && $index < @items)
+		{
+			$item = $items[$index];
+		}
+
+		my $start = resolve_item_start_dir($item);
+		my $selected = choose_directory($start);
+
+		if ($selected ne '')
+		{
+			js_call('window.dsBrowseResult(' . js_string($selected) . ');');
+		}
+
+		return;
+	}
+
+	if ($cmd eq 'remount')
+	{
+		do_remount();
+		return;
+	}
+
+	if ($cmd eq 'umount')
+	{
+		do_umount();
+		return;
+	}
+
+	if ($cmd eq 'quit')
+	{
+		try_quit();
+		return;
+	}
+
+	die_gui("Ismeretlen parancs: $cmd");
+}
+
+sub try_quit
+{
+	my ($overlay_mounted, $overlay_out_dir) = get_overlay_mount_status();
+	my @warnings = ();
+
+	if ($dirty_since_remount)
+	{
+		push @warnings, "Volt szerkesztés az utolsó remount óta.";
+	}
+
+	if ($overlay_mounted)
+	{
+		push @warnings,
+			"Az overlay mount továbbra is aktív:\n" .
+			$overlay_out_dir . "\n\n" .
+			"A program kilépéskor NEM csatolja le a projektet.";
+	}
+
+	if (@warnings)
+	{
+		my $message = join("\n\n", @warnings);
+		$message .= "\n\nBiztosan kilépsz?";
+
+		my $yes = ask_yes_no($message);
+
+		if (!$yes)
+		{
+			return TRUE;
+		}
+	}
+
+	Gtk3->main_quit();
+
+	return FALSE;
+}
+
+sub handle_title_message
+{
+	my $title = $webview->get_title();
+
+	return if !defined $title;
+	return if $title eq $last_title_message;
+
+	$last_title_message = $title;
+
+	return if $title !~ /^DSMSG:/;
+
+	my $encoded = $title;
+	$encoded =~ s/^DSMSG:\d+://;
+
+	my $decoded = uri_unescape($encoded);
+
+	handle_message($decoded);
+}
+
+sub html_page
+{
+	return <<'HTML';
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>dsOverlay GUI</title>
+<style>
+	body
+	{
+		font-family: sans-serif;
+		margin: 0;
+		padding: 0;
+		background: #202020;
+		color: #eeeeee;
+	}
+
+	#top
+	{
+		padding: 12px;
+		background: #303030;
+		border-bottom: 1px solid #555555;
+	}
+
+	.path
+	{
+		font-family: monospace;
+		font-size: 13px;
+		color: #d0d0d0;
+		word-break: break-all;
+	}
+
+	#main
+	{
+		padding: 12px;
+	}
+
+	#list
+	{
+		width: 100%;
+		height: 330px;
+		background: #101010;
+		color: #ffffff;
+		border: 1px solid #1e9fe8;
+		font-family: monospace;
+		font-size: 15px;
+		overflow-y: auto;
+		box-sizing: border-box;
+		outline: none;
+	}
+
+	.listRow
+	{
+		padding: 3px 5px;
+		white-space: pre;
+		cursor: default;
+		color: #ffffff;
+		background: #101010;
+		user-select: none;
+	}
+
+	.listRow.disabledItem
+	{
+		color: #555555;
+	}
+
+	.listRow.selectedItem
+	{
+		background: #405060;
+		color: #ffffff;
+	}
+
+	.listRow.selectedItem.disabledItem
+	{
+		background: #405060;
+		color: #c8c8c8;
+	}
+
+	.listRow:hover
+	{
+		background: #303840;
+		color: #ffffff;
+	}
+
+	.listRow:hover.disabledItem
+	{
+		background: #303840;
+		color: #b0b0b0;
+	}
+
+	button
+	{
+		margin: 4px;
+		padding: 8px 12px;
+		font-size: 14px;
+	}
+
+	.row
+	{
+		margin-top: 8px;
+	}
+
+	.status
+	{
+		margin-top: 10px;
+		padding: 8px;
+		background: #282828;
+		border: 1px solid #555555;
+	}
+
+	.warn
+	{
+		color: #ffcc66;
+	}
+
+	.ok
+	{
+		color: #99ff99;
+	}
+
+	.mountOn
+	{
+		color: #99ff99;
+		font-weight: bold;
+	}
+
+	.mountOff
+	{
+		color: #ffcc66;
+		font-weight: bold;
+	}
+
+	.small
+	{
+		font-size: 12px;
+		color: #bbbbbb;
+		margin-top: 8px;
+	}
+</style>
+</head>
+<body>
+	<div id="top">
+		<div><b>Projektmappa:</b></div>
+		<div class="path" id="projectDir"></div>
+
+		<div><b>hierarchia.txt:</b></div>
+		<div class="path" id="hierarchyFile"></div>
+
+		<div><b>dsOverlay bináris:</b></div>
+		<div class="path" id="dsOverlayBin"></div>
+
+		<div><b>Jogosultság:</b></div>
+		<div class="path" id="rootState"></div>
+
+		<div><b>Overlay mount állapot:</b></div>
+		<div class="path" id="mountState"></div>
+	</div>
+
+	<div id="main">
+		<div id="list" tabindex="0"></div>
+
+		<div class="row">
+			<button onclick="addItem()">Új elem</button>
+			<button onclick="editItem()">Módosítás</button>
+			<button onclick="deleteItem()">Törlés</button>
+			<button onclick="toggleItem()">Enable / Disable</button>
+			<button onclick="moveUp()">Fel</button>
+			<button onclick="moveDown()">Le</button>
+		</div>
+
+		<div class="row">
+			<button onclick="saveItems()">Mentés</button>
+			<button onclick="remount()">Remount</button>
+			<button onclick="umountOverlay()">Umount</button>
+			<button onclick="quitApp()">Kilépés</button>
+		</div>
+
+		<div class="status" id="status"></div>
+
+		<div class="small">
+			A GUI csak a hierarchia.txt fájlt szerkeszti. A tényleges mount/remount/umount műveletet a dsOverlay program végzi.
+			A tiltott sorok # előtaggal kerülnek mentésre.
+		</div>
+	</div>
+
+<script>
+let state =
+{
+	project_dir: "",
+	hierarchy_file: "",
+	hierarchy_dir: "",
+	dsoverlay_bin: "",
+	items: [],
+	dirty: 0,
+	dirty_since_remount: 0,
+	is_root: 0,
+	overlay_mounted: 0,
+	overlay_out_dir: ""
+};
+
+let browseMode = "";
+let editIndex = -1;
+let msgSeq = 0;
+let selectedRow = -1;
+
+function send(obj)
+{
+	msgSeq++;
+	document.title = "DSMSG:" + msgSeq + ":" + encodeURIComponent(JSON.stringify(obj));
+}
+
+function pad2(n)
+{
+	return String(n).padStart(2, "0");
+}
+
+function render()
+{
+	document.getElementById("projectDir").textContent = state.project_dir;
+	document.getElementById("hierarchyFile").textContent = state.hierarchy_file;
+	document.getElementById("dsOverlayBin").textContent = state.dsoverlay_bin;
+	document.getElementById("rootState").textContent = state.is_root ? "root joggal fut" : "normál felhasználói joggal fut";
+
+	const mountState = document.getElementById("mountState");
+
+	if (state.overlay_mounted)
+	{
+		mountState.innerHTML = '<span class="mountOn">MOUNT BE</span> — ' + state.overlay_out_dir;
+	}
+	else
+	{
+		mountState.innerHTML = '<span class="mountOff">MOUNT KI</span> — ' + state.overlay_out_dir;
+	}
+
+	const list = document.getElementById("list");
+
+	if (selectedRow >= state.items.length)
+	{
+		selectedRow = state.items.length - 1;
+	}
+
+	list.innerHTML = "";
+
+	for (let i = 0; i < state.items.length; i++)
+	{
+		const item = state.items[i];
+
+		const row = document.createElement("div");
+		row.className = "listRow";
+		row.dataset.index = String(i);
+
+		if (!item.enabled)
+		{
+			row.className += " disabledItem";
+		}
+
+		if (i === selectedRow)
+		{
+			row.className += " selectedItem";
+		}
+
+		let prefix = item.enabled ? "[ON ] " : "[OFF] ";
+		row.textContent = pad2(i + 1) + "  " + prefix + item.path;
+
+		row.onclick = function()
+		{
+			selectedRow = i;
+			render();
+			document.getElementById("list").focus();
+		};
+
+		row.ondblclick = function()
+		{
+			selectedRow = i;
+			editItem();
+		};
+
+		list.appendChild(row);
+	}
+
+	let txt = "";
+
+	if (state.dirty)
+	{
+		txt += '<span class="warn">Van nem mentett módosítás.</span><br>';
+	}
+	else
+	{
+		txt += '<span class="ok">A hierarchia.txt mentett állapotban van.</span><br>';
+	}
+
+	if (state.dirty_since_remount)
+	{
+		txt += '<span class="warn">Volt szerkesztés az utolsó remount óta.</span>';
+	}
+	else
+	{
+		txt += '<span class="ok">Nincs remount nélküli szerkesztés.</span>';
+	}
+
+	document.getElementById("status").innerHTML = txt;
+}
+
+window.dsSetState = function(newState)
+{
+	state = newState;
+
+	if (selectedRow < 0 && state.items.length > 0)
+	{
+		selectedRow = 0;
+	}
+
+	render();
+};
+
+window.dsBrowseResult = function(path)
+{
+	if (!path)
+	{
+		return;
+	}
+
+	if (browseMode === "new")
+	{
+		state.items.push(
+		{
+			enabled: 1,
+			path: path
+		});
+
+		selectedRow = state.items.length - 1;
+		state.dirty = 1;
+		saveItems();
+	}
+	else if (browseMode === "edit")
+	{
+		if (editIndex >= 0 && editIndex < state.items.length)
+		{
+			state.items[editIndex].path = path;
+			selectedRow = editIndex;
+			state.dirty = 1;
+			saveItems();
+		}
+	}
+
+	browseMode = "";
+	editIndex = -1;
+};
+
+function selectedIndex()
+{
+	return selectedRow;
+}
+
+function addItem()
+{
+	browseMode = "new";
+	editIndex = -1;
+	send({cmd: "browse_new"});
+}
+
+function editItem()
+{
+	const idx = selectedIndex();
+
+	if (idx < 0 || idx >= state.items.length)
+	{
+		alert("Nincs kiválasztott elem.");
+		return;
+	}
+
+	browseMode = "edit";
+	editIndex = idx;
+
+	send({cmd: "browse_edit", index: idx});
+}
+
+function deleteItem()
+{
+	const idx = selectedIndex();
+
+	if (idx < 0 || idx >= state.items.length)
+	{
+		alert("Nincs kiválasztott elem.");
+		return;
+	}
+
+	if (!confirm("Biztosan törlöd ezt az elemet?\n\n" + state.items[idx].path))
+	{
+		return;
+	}
+
+	state.items.splice(idx, 1);
+
+	if (selectedRow >= state.items.length)
+	{
+		selectedRow = state.items.length - 1;
+	}
+
+	state.dirty = 1;
+	saveItems();
+}
+
+function toggleItem()
+{
+	const idx = selectedIndex();
+
+	if (idx < 0 || idx >= state.items.length)
+	{
+		alert("Nincs kiválasztott elem.");
+		return;
+	}
+
+	state.items[idx].enabled = state.items[idx].enabled ? 0 : 1;
+	selectedRow = idx;
+	state.dirty = 1;
+	saveItems();
+}
+
+function moveUp()
+{
+	const idx = selectedIndex();
+
+	if (idx <= 0 || idx >= state.items.length)
+	{
+		return;
+	}
+
+	const tmp = state.items[idx - 1];
+	state.items[idx - 1] = state.items[idx];
+	state.items[idx] = tmp;
+
+	selectedRow = idx - 1;
+	state.dirty = 1;
+	saveItems();
+}
+
+function moveDown()
+{
+	const idx = selectedIndex();
+
+	if (idx < 0 || idx >= state.items.length - 1)
+	{
+		return;
+	}
+
+	const tmp = state.items[idx + 1];
+	state.items[idx + 1] = state.items[idx];
+	state.items[idx] = tmp;
+
+	selectedRow = idx + 1;
+	state.dirty = 1;
+	saveItems();
+}
+
+function saveItems()
+{
+	send({cmd: "save_items", items: state.items});
+}
+
+function remount()
+{
+	send({cmd: "remount"});
+}
+
+function umountOverlay()
+{
+	send({cmd: "umount"});
+}
+
+function quitApp()
+{
+	send({cmd: "quit"});
+}
+
+document.addEventListener("keydown", function(e)
+{
+	if (document.activeElement.id !== "list")
+	{
+		return;
+	}
+
+	if (e.key === "ArrowUp")
+	{
+		if (selectedRow > 0)
+		{
+			selectedRow--;
+			render();
+		}
+
+		e.preventDefault();
+		return;
+	}
+
+	if (e.key === "ArrowDown")
+	{
+		if (selectedRow < state.items.length - 1)
+		{
+			selectedRow++;
+			render();
+		}
+
+		e.preventDefault();
+		return;
+	}
+
+	if (e.key === "Enter")
+	{
+		editItem();
+		e.preventDefault();
+		return;
+	}
+
+	if (e.key === " ")
+	{
+		toggleItem();
+		e.preventDefault();
+		return;
+	}
+
+	if (e.key === "Delete")
+	{
+		deleteItem();
+		e.preventDefault();
+		return;
+	}
+});
+
+window.onload = function()
+{
+	send({cmd: "ready"});
+};
+</script>
+</body>
+</html>
+HTML
+}
+
+sub create_gui
+{
+	$window = Gtk3::Window->new('toplevel');
+	$window->set_title($APP_TITLE);
+	$window->set_default_size(660, 820);
+
+	set_app_icon($window);
+
+	$webview = Gtk3::WebKit2::WebView->new();
+
+	$webview->signal_connect('notify::title' => sub
+	{
+		handle_title_message();
+
+		return TRUE;
+	});
+
+	$window->add($webview);
+
+	$window->signal_connect(delete_event => sub
+	{
+		return try_quit();
+	});
+
+	$webview->load_html(html_page(), 'file:///');
+
+	$window->show_all();
+}
+
+init_paths();
+load_hierarchy();
+create_gui();
+
+Gtk3->main();

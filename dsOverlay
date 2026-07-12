@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Ha nincs hierarchia.txt, ezzel a kezdő sorral hozza létre.
+DEFAULT_HIERARCHY_LINE="./lower"
+
+# A kezdő lower mappa neve. Ez a környezeti mappán belül jön létre.
+DEFAULT_LOWER_DIR="./lower"
+
+# A CLI tool által létrehozott fájlok/mappák jogosultsága.
+CREATED_MODE="777"
+
+die()
+{
+	echo "HIBA: $*" >&2
+	exit 1
+}
+
+usage()
+{
+	echo "Használat:"
+	echo "  $0 /eleresi/ut/kornyezeti_mappa"
+	echo "  $0 mount /eleresi/ut/kornyezeti_mappa"
+	echo "  $0 remount /eleresi/ut/kornyezeti_mappa"
+	echo "  $0 umount /eleresi/ut/kornyezeti_mappa"
+	echo
+	echo "Ha csak a mappát adod meg, akkor alapértelmezés szerint remount történik."
+	echo
+	echo "A környezeti mappán belül:"
+	echo "  hierarchia.txt      kötelező; ha nincs, a program rákérdez a létrehozásra"
+	echo "  overlay/            automatikusan létrejön, ha nincs; ide kerülnek az out-ba írt módosítások"
+	echo "  overlay.work/       automatikusan létrejön, ha nincs; overlayfs belső munkamappa"
+	echo "  out/                automatikusan létrejön, ha nincs; nem lehet symlink; ez az eredő mountolt nézet"
+	echo
+	echo "Alapértelmezett létrehozás hiányzó hierarchia.txt esetén:"
+	echo "  lower mappa:         $DEFAULT_LOWER_DIR"
+	echo "  hierarchia.txt sor:  $DEFAULT_HIERARCHY_LINE"
+	echo "  létrehozott jogok:   $CREATED_MODE"
+	echo
+	echo "A hierarchia.txt működése:"
+	echo "  - soronként egy lower/read-only réteg mappaútvonalat tartalmaz"
+	echo "  - a sorrend alulról felfelé értendő"
+	echo "  - az első érvényes mappasor lesz a legalsó réteg"
+	echo "  - az utolsó érvényes mappasor lesz a legfelső lower réteg"
+	echo "  - az overlay/ mappa külön kerül rá legfelső írható rétegként"
+	echo "  - üres sorok kihagyásra kerülnek"
+	echo "  - a # karakterrel kezdődő sor komment, teljesen kihagyásra kerül"
+	echo
+	echo "Útvonalak a hierarchia.txt-ben:"
+	echo "  /valami/mappa       abszolút útvonal"
+	echo "  valami/mappa        relatív útvonal a környezeti mappához képest"
+	echo "  ./valami/mappa      szintén relatív útvonal a környezeti mappához képest"
+	echo "  ../valami/mappa     relatív útvonal a környezeti mappához képest"
+	echo
+	echo "Fontos:"
+	echo "  Ha egy mappanév # karakterrel kezdődik, akkor mindenképpen ./ vagy / előtaggal add meg,"
+	echo "  különben kommentként lesz értelmezve."
+	echo
+	echo "Példák:"
+	echo "  # eredeti alapréteg"
+	echo "  ../dataORIG"
+	echo "  LAYERS/V101"
+	echo "  ./LAYERS/V102"
+	echo "  /Data500/valodi/abszolut/reteg"
+	echo
+	echo "Példa # karakterrel kezdődő mappára:"
+	echo "  ./#teszt_reteg"
+	echo "  /Data500/#teszt_reteg"
+	exit 1
+}
+
+need_root()
+{
+	if [[ "${EUID}" -ne 0 ]]
+	then
+		echo "Rendszergazdai jogosultság kell az overlay mount művelethez."
+		echo "Sudo jelszó bekérése konzolban..."
+
+		sudo -v || die "Sikertelen sudo hitelesítés"
+
+		exec sudo -- "$0" "$@"
+	fi
+}
+
+real_path_for_env()
+{
+	local path="$1"
+	local resolved
+
+	resolved="$(readlink -f "$path" 2>/dev/null || true)"
+
+	if [[ -z "$resolved" ]]
+	then
+		die "A környezeti mappa nem létezik vagy nem feloldható: $path"
+	fi
+
+	if [[ ! -d "$resolved" ]]
+	then
+		die "A környezeti útvonal nem könyvtár: $resolved"
+	fi
+
+	printf '%s\n' "$resolved"
+}
+
+trim_line()
+{
+	local line="$1"
+
+	line="${line%%#*}"
+	line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+	printf '%s\n' "$line"
+}
+
+check_no_colon()
+{
+	local path="$1"
+
+	if [[ "$path" == *:* ]]
+	then
+		die "Az útvonal ':' karaktert tartalmaz, ez overlayfs lowerdir esetén gondot okoz: $path"
+	fi
+}
+
+chmod_created()
+{
+	local path="$1"
+
+	chmod "$CREATED_MODE" "$path" || die "Nem sikerült jogosultságot állítani erre: $path"
+}
+
+ensure_dir_777()
+{
+	local path="$1"
+
+	if [[ -L "$path" ]]
+	then
+		die "Ez a mappa nem lehet symlink: $path"
+	fi
+
+	if [[ ! -e "$path" ]]
+	then
+		mkdir -p "$path" || die "Nem sikerült létrehozni a mappát: $path"
+		chmod_created "$path"
+	elif [[ ! -d "$path" ]]
+	then
+		die "Létezik, de nem könyvtár: $path"
+	fi
+}
+
+ask_yes_no()
+{
+	local question="$1"
+	local answer=""
+
+	while true
+	do
+		printf "%s [i/N]: " "$question" >&2
+
+		if ! read -r answer
+		then
+			return 1
+		fi
+
+		case "$answer" in
+			i|I|igen|IGEN|y|Y|yes|YES)
+				return 0
+				;;
+			n|N|nem|NEM|no|NO|"")
+				return 1
+				;;
+			*)
+				echo "Kérlek i/n választ adj." >&2
+				;;
+		esac
+	done
+}
+
+default_lower_abs_path()
+{
+	local env_dir="$1"
+	local lower_path="$DEFAULT_LOWER_DIR"
+
+	if [[ "$lower_path" != /* ]]
+	then
+		lower_path="$env_dir/$lower_path"
+	fi
+
+	printf '%s\n' "$lower_path"
+}
+
+create_default_hierarchy()
+{
+	local env_dir="$1"
+	local hierarchy_file="$env_dir/hierarchia.txt"
+	local lower_dir
+
+	lower_dir="$(default_lower_abs_path "$env_dir")"
+
+	if [[ -f "$hierarchy_file" ]]
+	then
+		return 0
+	fi
+
+	echo "Alapértelmezett hierarchia létrehozása:"
+	echo "  lower mappa:        $lower_dir"
+	echo "  hierarchia.txt:     $hierarchy_file"
+	echo "  kezdő sor:          $DEFAULT_HIERARCHY_LINE"
+	echo "  jogosultság:        $CREATED_MODE"
+	echo
+
+	# Fontos: előbb a lower mappa.
+	# Ha ez elbukik, a TXT-t meg sem próbáljuk létrehozni.
+	if [[ -L "$lower_dir" ]]
+	then
+		die "Az alapértelmezett lower mappa nem lehet symlink: $lower_dir"
+	fi
+
+	if [[ ! -e "$lower_dir" ]]
+	then
+		mkdir -p "$lower_dir" || die "Nem sikerült létrehozni az alapértelmezett lower mappát: $lower_dir"
+		chmod_created "$lower_dir"
+	elif [[ ! -d "$lower_dir" ]]
+	then
+		die "Az alapértelmezett lower útvonal létezik, de nem könyvtár: $lower_dir"
+	fi
+
+	# Csak akkor jutunk ide, ha a lower mappa már létezik.
+	umask 000
+
+	printf '%s\n' "$DEFAULT_HIERARCHY_LINE" > "$hierarchy_file" || die "Nem sikerült létrehozni a hierarchia.txt fájlt: $hierarchy_file"
+	chmod_created "$hierarchy_file"
+
+	echo "Alapértelmezett hierarchia létrehozva."
+}
+
+ensure_hierarchy_file()
+{
+	local env_dir="$1"
+	local hierarchy_file="$env_dir/hierarchia.txt"
+
+	if [[ -f "$hierarchy_file" ]]
+	then
+		return 0
+	fi
+
+	echo "Hiányzik a hierarchia.txt:"
+	echo "  $hierarchy_file"
+	echo
+
+	if ask_yes_no "Létre akarod hozni az alapértelmezett hierarchia.txt fájlt?"
+	then
+		create_default_hierarchy "$env_dir"
+	else
+		die "Nincs hierarchia.txt, a művelet megszakítva."
+	fi
+}
+
+prepare_env()
+{
+	local env_dir="$1"
+
+	[[ -d "$env_dir" ]] || die "A környezeti mappa nem létezik: $env_dir"
+
+	local hierarchy_file="$env_dir/hierarchia.txt"
+	local upper_dir="$env_dir/overlay"
+	local work_dir="$env_dir/overlay.work"
+	local out_dir="$env_dir/out"
+
+	ensure_hierarchy_file "$env_dir"
+
+	[[ -f "$hierarchy_file" ]] || die "Hiányzik: $hierarchy_file"
+
+	ensure_dir_777 "$upper_dir"
+	ensure_dir_777 "$work_dir"
+	ensure_dir_777 "$out_dir"
+
+	check_no_colon "$upper_dir"
+	check_no_colon "$work_dir"
+	check_no_colon "$out_dir"
+}
+
+build_lowerdir_string()
+{
+	local env_dir="$1"
+	local hierarchy_file="$env_dir/hierarchia.txt"
+
+	local lower_dirs=()
+	local raw_line
+	local line
+	local original_line
+	local resolved
+	local line_no=0
+
+	while IFS= read -r raw_line || [[ -n "$raw_line" ]]
+	do
+		line_no=$((line_no + 1))
+
+		line="$(trim_line "$raw_line")"
+
+		if [[ -z "$line" ]]
+		then
+			continue
+		fi
+
+		original_line="$line"
+
+		if [[ "$line" == \#* ]]
+		then
+			continue
+		fi
+
+		if [[ "$line" != /* ]]
+		then
+			line="$env_dir/$line"
+		fi
+
+		resolved="$(readlink -f "$line" 2>/dev/null || true)"
+
+		if [[ -z "$resolved" ]]
+		then
+			{
+				echo "A hierarchia egyik eleme nem feloldható:"
+				echo "  fájl:                 $hierarchy_file"
+				echo "  sorszám:              $line_no"
+				echo "  hierarchia.txt sor:   $original_line"
+				echo "  értelmezett útvonal:  $line"
+				echo
+				echo "Magyarázat:"
+				echo "  Az útvonal nem oldható fel létező fájlrendszerbeli elemre."
+				echo "  Ellenőrizd, hogy nincs-e elírás, rossz relatív útvonal vagy hibás symlink."
+			} >&2
+
+			die "A hierarchia egyik eleme nem feloldható"
+		fi
+
+		if [[ ! -d "$resolved" ]]
+		then
+			{
+				echo "Nem létező vagy nem könyvtár lower réteg:"
+				echo "  fájl:                 $hierarchy_file"
+				echo "  sorszám:              $line_no"
+				echo "  hierarchia.txt sor:   $original_line"
+				echo "  értelmezett útvonal:  $line"
+				echo "  feloldott útvonal:    $resolved"
+				echo
+				echo "Magyarázat:"
+				echo "  Az overlayfs lower rétege csak létező könyvtár lehet."
+				echo "  Ha symlinket használsz, akkor a symlink céljának is létező könyvtárnak kell lennie."
+				echo
+				echo "Ellenőrzéshez futtasd:"
+				echo "  ls -ld \"$resolved\""
+			} >&2
+
+			die "A hierarchia egyik eleme nem könyvtár"
+		fi
+
+		check_no_colon "$resolved"
+
+		lower_dirs+=("$resolved")
+	done < "$hierarchy_file"
+
+	if [[ "${#lower_dirs[@]}" -lt 1 ]]
+	then
+		{
+			echo "A hierarchia.txt nem tartalmaz lower réteget:"
+			echo "  fájl: $hierarchy_file"
+			echo
+			echo "Legalább egy nem komment, nem üres sor kell."
+			echo
+			echo "Példa:"
+			echo "  $DEFAULT_HIERARCHY_LINE"
+			echo "  ../dataORIG"
+			echo "  LAYERS/V101"
+		} >&2
+
+		die "A hierarchia.txt nem tartalmaz lower réteget"
+	fi
+
+	local lowerdir_string=""
+
+	for (( i=${#lower_dirs[@]}-1; i>=0; i-- ))
+	do
+		if [[ -z "$lowerdir_string" ]]
+		then
+			lowerdir_string="${lower_dirs[$i]}"
+		else
+			lowerdir_string="${lowerdir_string}:${lower_dirs[$i]}"
+		fi
+	done
+
+	printf '%s\n' "$lowerdir_string"
+}
+
+is_project_mounted()
+{
+	local env_dir="$1"
+	local out_dir="$env_dir/out"
+
+	if [[ ! -d "$out_dir" ]]
+	then
+		return 1
+	fi
+
+	mountpoint -q "$out_dir"
+}
+
+remove_work_dir_after_umount()
+{
+	local env_dir="$1"
+	local work_dir="$env_dir/overlay.work"
+
+	if is_project_mounted "$env_dir"
+	then
+		die "Az overlay még mountolva van, ezért a work mappát nem törlöm: $work_dir"
+	fi
+
+	if [[ -L "$work_dir" ]]
+	then
+		die "A work mappa nem lehet symlink, ezért nem törlöm: $work_dir"
+	fi
+
+	if [[ ! -e "$work_dir" ]]
+	then
+		return 0
+	fi
+
+	if [[ ! -d "$work_dir" ]]
+	then
+		die "A work útvonal létezik, de nem könyvtár: $work_dir"
+	fi
+
+	rm -rf -- "$work_dir"
+
+	echo "Overlay work mappa törölve:"
+	echo "  $work_dir"
+}
+
+mount_overlay()
+{
+	local env_dir="$1"
+
+	prepare_env "$env_dir"
+
+	local upper_dir="$env_dir/overlay"
+	local work_dir="$env_dir/overlay.work"
+	local out_dir="$env_dir/out"
+
+	if is_project_mounted "$env_dir"
+	then
+		die "Az out már mountolva van. A work mappát nem törlöm. Használd inkább: $0 remount $env_dir"
+	fi
+
+	# A workdir csak biztosan lecsatolt projekt esetén üríthető.
+	if [[ -n "$(find "$work_dir" -mindepth 1 -maxdepth 1 2>/dev/null)" ]]
+	then
+		echo "Az overlay.work nem üres, ürítés:"
+		echo "  $work_dir"
+
+		find "$work_dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+	fi
+
+	local lowerdir_string
+	lowerdir_string="$(build_lowerdir_string "$env_dir")"
+
+	echo "Környezeti mappa: $env_dir"
+	echo "Upperdir: $upper_dir"
+	echo "Workdir:  $work_dir"
+	echo "Out:      $out_dir"
+	echo "Lowerdir: $lowerdir_string"
+	echo
+
+	mount -t overlay overlay \
+		-o "lowerdir=${lowerdir_string},upperdir=${upper_dir},workdir=${work_dir}" \
+		"$out_dir"
+
+	echo "Overlay mount kész:"
+	echo "  $out_dir"
+}
+
+umount_overlay()
+{
+	local env_dir="$1"
+
+	prepare_env "$env_dir"
+
+	local out_dir="$env_dir/out"
+
+	if ! is_project_mounted "$env_dir"
+	then
+		echo "Az out nincs mountolva: $out_dir"
+		remove_work_dir_after_umount "$env_dir"
+		return 0
+	fi
+
+	umount "$out_dir"
+
+	if is_project_mounted "$env_dir"
+	then
+		die "Az umount parancs után az out továbbra is mountolva van: $out_dir"
+	fi
+
+	echo "Overlay lecsatolva:"
+	echo "  $out_dir"
+
+	remove_work_dir_after_umount "$env_dir"
+}
+
+remount_overlay()
+{
+	local env_dir="$1"
+
+	prepare_env "$env_dir"
+
+	local out_dir="$env_dir/out"
+
+	if is_project_mounted "$env_dir"
+	then
+		echo "Meglévő overlay lecsatolása:"
+		echo "  $out_dir"
+		umount "$out_dir"
+
+		if is_project_mounted "$env_dir"
+		then
+			die "Az umount parancs után az out továbbra is mountolva van: $out_dir"
+		fi
+
+		remove_work_dir_after_umount "$env_dir"
+	else
+		echo "Az out nem volt mountolva, új mount következik:"
+		echo "  $out_dir"
+	fi
+
+	mount_overlay "$env_dir"
+}
+
+parse_args()
+{
+	local cmd
+	local env_arg
+
+	if [[ "$#" -eq 1 ]]
+	then
+		cmd="remount"
+		env_arg="$1"
+	elif [[ "$#" -eq 2 ]]
+	then
+		cmd="$1"
+		env_arg="$2"
+	else
+		usage
+	fi
+
+	case "$cmd" in
+		mount|remount|umount)
+			;;
+		*)
+			usage
+			;;
+	esac
+
+	local env_dir
+	env_dir="$(real_path_for_env "$env_arg")"
+
+	printf '%s\n' "$cmd"
+	printf '%s\n' "$env_dir"
+}
+
+main()
+{
+	need_root "$@"
+
+	local parsed
+	parsed="$(parse_args "$@")"
+
+	local cmd
+	local env_dir
+
+	cmd="$(printf '%s\n' "$parsed" | sed -n '1p')"
+	env_dir="$(printf '%s\n' "$parsed" | sed -n '2p')"
+
+	case "$cmd" in
+		mount)
+			mount_overlay "$env_dir"
+			;;
+		remount)
+			remount_overlay "$env_dir"
+			;;
+		umount)
+			umount_overlay "$env_dir"
+			;;
+		*)
+			usage
+			;;
+	esac
+}
+
+main "$@"
